@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -69,8 +70,41 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Build the keyword set from the description (lowercased words).
+    keywords = [w for w in re.findall(r"[a-z0-9]+", description.lower()) if w]
+
+    size_filter = size.lower().strip() if size else None
+
+    scored: list[tuple[int, dict]] = []
+    for item in listings:
+        # 1. Price filter (inclusive).
+        if max_price is not None and item["price"] > max_price:
+            continue
+
+        # 2. Size filter (case-insensitive substring match, e.g. "M" in "S/M").
+        if size_filter is not None:
+            if size_filter not in str(item.get("size", "")).lower():
+                continue
+
+        # 3. Score by keyword overlap against title, description, and style_tags.
+        haystack = " ".join([
+            item.get("title", ""),
+            item.get("description", ""),
+            " ".join(item.get("style_tags", [])),
+            item.get("category", ""),
+        ]).lower()
+
+        score = sum(1 for kw in keywords if kw in haystack)
+
+        # 4. Drop listings with no relevant matches.
+        if score > 0:
+            scored.append((score, item))
+
+    # 5. Sort by score, highest first (stable — preserves dataset order on ties).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +134,61 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_desc = (
+        f"{new_item.get('title', 'this item')} "
+        f"(category: {new_item.get('category', 'unknown')}, "
+        f"colors: {', '.join(new_item.get('colors', [])) or 'n/a'}, "
+        f"style: {', '.join(new_item.get('style_tags', [])) or 'n/a'}). "
+        f"{new_item.get('description', '')}"
+    )
+
+    items = wardrobe.get("items", []) if wardrobe else []
+
+    if not items:
+        # Empty wardrobe: general styling advice, not specific pairings.
+        prompt = (
+            "You are a friendly personal stylist. A user is considering buying this "
+            f"secondhand item:\n{item_desc}\n\n"
+            "They haven't added anything to their wardrobe yet. Give 1-2 short, "
+            "general styling ideas: what kinds of pieces (categories, colors, vibes) "
+            "pair well with it and what aesthetic it suits. End by noting that "
+            "suggestions get more personal once they add items to their wardrobe. "
+            "Keep it under 120 words and conversational."
+        )
+    else:
+        wardrobe_lines = "\n".join(
+            f"- {it.get('name', 'item')} "
+            f"({it.get('category', '?')}; {', '.join(it.get('colors', []))})"
+            + (f" — {it['notes']}" if it.get("notes") else "")
+            for it in items
+        )
+        prompt = (
+            "You are a friendly personal stylist. A user is considering buying this "
+            f"secondhand item:\n{item_desc}\n\n"
+            f"Here is what they already own:\n{wardrobe_lines}\n\n"
+            "Suggest 1-2 complete, wearable outfits that combine the new item with "
+            "SPECIFIC pieces named from their wardrobe above. Refer to the owned "
+            "pieces by name. Keep it under 150 words and conversational."
+        )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        text = (response.choices[0].message.content or "").strip()
+    except Exception:
+        text = ""
+
+    if not text:
+        # Fallback so the loop never receives an empty string.
+        return (
+            f"Couldn't generate a styled look right now, but {new_item.get('title', 'this piece')} "
+            "is a versatile find — pair it with your go-to denim and clean sneakers to start."
+        )
+    return text
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +220,41 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty / whitespace-only outfit.
+    if not outfit or not outfit.strip():
+        return "No outfit available to caption — generate an outfit first."
+
+    title = new_item.get("title", "this thrifted find")
+    price = new_item.get("price")
+    price_str = f"${price:.0f}" if isinstance(price, (int, float)) else "a steal"
+    platform = new_item.get("platform", "secondhand")
+
+    prompt = (
+        "Write a short, casual social-media caption (an OOTD post) for a thrifted "
+        "outfit. It should feel authentic and fun — NOT like a product description.\n\n"
+        f"Item: {title}, {price_str}, found on {platform}.\n"
+        f"Outfit: {outfit}\n\n"
+        "Rules: 2-4 sentences. Mention the item name, price, and platform naturally "
+        "ONCE each. Capture the outfit's vibe in specific terms. A couple of emoji are "
+        "fine. Output only the caption."
+    )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            # Higher temperature so repeated calls on the same input vary.
+            temperature=1.0,
+        )
+        text = (response.choices[0].message.content or "").strip()
+    except Exception:
+        text = ""
+
+    if not text:
+        # Hand-built fallback so the user always gets something shareable.
+        return (
+            f"Thrifted gem alert 🛍️ Snagged this {title} for {price_str} on {platform}. "
+            "Styling it up — but honestly it speaks for itself ✨"
+        )
+    return text
